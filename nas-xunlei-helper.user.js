@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         迅雷下载助手脚本版
 // @namespace    https://github.com/saaak/xunlei-docker-ext
-// @version      1.3.2
-// @description  基于 saaak/xunlei-docker-ext 扩展移植重构，专为迅雷 NAS (群晖 DSM / Docker / 威联通 QNAP) 与 Firefox / Chrome 深度适配。一键抓取全网磁力链接推送到远程 NAS，支持双向下载状态实时同步与目录平铺直存。
+// @version      1.4.0
+// @description  基于 saaak/xunlei-docker-ext 扩展移植重构，专为迅雷 NAS (群晖 DSM / Docker / 威联通 QNAP) 与 Firefox / Chrome 深度适配。一键抓取全网磁力链接与种子文件（.torrent）推送到远程 NAS，支持双向下载状态实时同步与目录平铺直存。
 // @author       Community
 // @license      MIT
 // @match        *://*/*
@@ -10,8 +10,10 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @connect      xluser-ssl.xunlei.com
 // @connect      api-pan.xunlei.com
+// @connect      *
 // ==/UserScript==
 
 (function () {
@@ -170,29 +172,197 @@
         return match ? match[1].toLowerCase() : '';
     }
 
-    /**
-     * 全网智能标题推导引擎（兼容 1337x / Nyaa / Sukebei / 蜜柑及任意站点）
-     */
-    function extractSmartTitle(targetElement, magnetLink) {
-        // 1. 优先从磁链自带的 dn 参数提取（最权威真实文件名，1337x 和 Nyaa 均完整包含）
-        try {
-            const urlObj = new URL(magnetLink.replace(/&amp;/g, '&'));
-            const dn = urlObj.searchParams.get('dn');
-            if (dn && dn.trim().length > 2) {
-                return decodeURIComponent(dn).replace(/\+/g, ' ').trim();
+    // -------------------------------------------------------------------------
+    // 工具函数：SHA-1 计算与 Bencode 种子解析引擎（无第三方依赖，纯原生实现）
+    // -------------------------------------------------------------------------
+    function sha1(bytes) {
+        if (typeof bytes === 'string') {
+            bytes = new TextEncoder().encode(bytes);
+        }
+        const len = bytes.length;
+        const totalWords = (((len + 8) >> 6) + 1) * 16;
+        const words = new Int32Array(totalWords);
+        for (let i = 0; i < len; i++) {
+            words[i >> 2] |= bytes[i] << (24 - (i % 4) * 8);
+        }
+        words[len >> 2] |= 0x80 << (24 - (len % 4) * 8);
+        words[totalWords - 2] = Math.floor((len * 8) / 0x100000000);
+        words[totalWords - 1] = (len * 8) >>> 0;
+
+        let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;
+        const w = new Int32Array(80);
+
+        for (let i = 0; i < totalWords; i += 16) {
+            for (let j = 0; j < 16; j++) w[j] = words[i + j];
+            for (let j = 16; j < 80; j++) {
+                const val = w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16];
+                w[j] = (val << 1) | (val >>> 31);
             }
-        } catch (e) {
-            const match = magnetLink.match(/[?&]dn=([^&]+)/i);
-            if (match) {
-                try {
-                    return decodeURIComponent(match[1].replace(/\+/g, ' ')).trim();
-                } catch (e2) {}
+
+            let a = h0, b = h1, c = h2, d = h3, e = h4;
+            for (let j = 0; j < 80; j++) {
+                let f, k;
+                if (j < 20) {
+                    f = (b & c) | ((~b) & d);
+                    k = 0x5A827999;
+                } else if (j < 40) {
+                    f = b ^ c ^ d;
+                    k = 0x6ED9EBA1;
+                } else if (j < 60) {
+                    f = (b & c) | (b & d) | (c & d);
+                    k = 0x8F1BBCDC;
+                } else {
+                    f = b ^ c ^ d;
+                    k = 0xCA62C1D6;
+                }
+                const temp = (((a << 5) | (a >>> 27)) + f + e + k + w[j]) | 0;
+                e = d;
+                d = c;
+                c = ((b << 30) | (b >>> 2)) | 0;
+                b = a;
+                a = temp;
+            }
+
+            h0 = (h0 + a) | 0;
+            h1 = (h1 + b) | 0;
+            h2 = (h2 + c) | 0;
+            h3 = (h3 + d) | 0;
+            h4 = (h4 + e) | 0;
+        }
+
+        const hex = (n) => (n >>> 0).toString(16).padStart(8, '0');
+        return (hex(h0) + hex(h1) + hex(h2) + hex(h3) + hex(h4)).toLowerCase();
+    }
+
+    function extractInfoHashFromTorrentBytes(bytes) {
+        if (!bytes || bytes.length === 0) return null;
+        const len = bytes.length;
+        let infoStart = -1;
+        // 检索 "4:info" 关键字 (ASCII: 52, 58, 105, 110, 102, 111)
+        for (let i = 0; i < len - 7; i++) {
+            if (bytes[i] === 52 && bytes[i+1] === 58 && bytes[i+2] === 105 &&
+                bytes[i+3] === 110 && bytes[i+4] === 102 && bytes[i+5] === 111) {
+                infoStart = i + 6;
+                break;
+            }
+        }
+        if (infoStart === -1) return null;
+
+        let pos = infoStart;
+        function parseValue() {
+            if (pos >= len) throw new Error('Unexpected EOF');
+            const byte = bytes[pos];
+            if (byte === 105) { // 'i' 整数
+                pos++;
+                while (pos < len && bytes[pos] !== 101) pos++;
+                if (pos >= len) throw new Error('Unterminated int');
+                pos++; // 跳过 'e'
+            } else if (byte === 108 || byte === 100) { // 'l' 列表 或 'd' 字典
+                pos++;
+                while (pos < len && bytes[pos] !== 101) {
+                    parseValue();
+                }
+                if (pos >= len) throw new Error('Unterminated list/dict');
+                pos++; // 跳过 'e'
+            } else if (byte >= 48 && byte <= 57) { // 字符串以长度数字 0-9 开头
+                let colonIdx = pos;
+                while (colonIdx < len && bytes[colonIdx] >= 48 && bytes[colonIdx] <= 57) {
+                    colonIdx++;
+                }
+                if (colonIdx >= len || bytes[colonIdx] !== 58) throw new Error('Invalid string length');
+                let strLen = 0;
+                for (let i = pos; i < colonIdx; i++) {
+                    strLen = strLen * 10 + (bytes[i] - 48);
+                }
+                pos = colonIdx + 1 + strLen;
+            } else {
+                throw new Error('Unknown bencode token: ' + byte);
             }
         }
 
-        // 2. 表格行内查找（Nyaa、Sukebei、蜜柑、DMHY）
+        try {
+            parseValue();
+            const infoBytes = bytes.subarray(infoStart, pos);
+            return sha1(infoBytes);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function resolveTorrentToMagnet(torrentUrl, title) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: torrentUrl,
+                responseType: 'arraybuffer',
+                timeout: 25000,
+                headers: {
+                    'Referer': window.location.href,
+                    'User-Agent': navigator.userAgent,
+                    'Accept': 'application/x-bittorrent, */*'
+                },
+                onload: (res) => {
+                    try {
+                        if (res.status >= 200 && res.status < 300) {
+                            const bytes = new Uint8Array(res.response);
+                            const infoHash = extractInfoHashFromTorrentBytes(bytes);
+                            if (!infoHash) {
+                                reject(new Error('未能从种子文件中解析出有效 InfoHash'));
+                                return;
+                            }
+                            const cleanTitle = title || '种子文件直推';
+                            const magnet = `magnet:?xt=urn:btih:${infoHash}&dn=${encodeURIComponent(cleanTitle)}`;
+                            resolve({ magnet, infoHash });
+                        } else {
+                            reject(new Error(`下载种子失败，HTTP状态码: ${res.status}`));
+                        }
+                    } catch (e) {
+                        reject(new Error(`解析种子异常: ${e.message}`));
+                    }
+                },
+                onerror: () => reject(new Error('网络请求错误，无法下载种子文件')),
+                ontimeout: () => reject(new Error('下载种子文件超时'))
+            });
+        });
+    }
+
+    /**
+     * 全网智能标题推导引擎（兼容 1337x / Nyaa / Sukebei / 蜜柑及各类论坛种子附件）
+     */
+    function extractSmartTitle(targetElement, magnetLink) {
+        // 1. 优先从磁链自带的 dn 参数提取（最权威真实文件名，1337x 和 Nyaa 均完整包含）
+        if (magnetLink) {
+            try {
+                const urlObj = new URL(magnetLink.replace(/&amp;/g, '&'));
+                const dn = urlObj.searchParams.get('dn');
+                if (dn && dn.trim().length > 2) {
+                    return decodeURIComponent(dn).replace(/\+/g, ' ').trim();
+                }
+            } catch (e) {
+                const match = magnetLink.match(/[?&]dn=([^&]+)/i);
+                if (match) {
+                    try {
+                        return decodeURIComponent(match[1].replace(/\+/g, ' ')).trim();
+                    } catch (e2) {}
+                }
+            }
+        }
+
+        // 2. 目标元素自身若明确为种子文件名（如 1lou、各类论坛附件中的 Resident.Evil...torrent）
+        const directText = targetElement.innerText ? targetElement.innerText.trim() : (targetElement.textContent ? targetElement.textContent.trim() : '');
+        if (/\.torrent$/i.test(directText)) {
+            return directText.replace(/\.torrent$/i, '').trim();
+        }
+
+        // 3. 表格行内查找（Nyaa、Sukebei、蜜柑、DMHY、论坛附件行）
         const row = targetElement.closest('tr, li, .torrent-item, .item');
         if (row) {
+            // 论坛附件行或种子文件名链接
+            const torrentA = row.querySelector('a[href*=".torrent"], a[href*="attach-download"]');
+            if (torrentA && torrentA.innerText.trim() && /\.torrent$/i.test(torrentA.innerText.trim())) {
+                return torrentA.innerText.trim().replace(/\.torrent$/i, '');
+            }
+
             // Nyaa / Sukebei: td a[href*="/view/"]
             const nyaaA = row.querySelector('td:not(.text-center) a[href*="/view/"]:not(.comments), a[href*="/view/"]:not(.comments)');
             if (nyaaA && nyaaA.innerText.trim()) return nyaaA.innerText.trim();
@@ -210,23 +380,22 @@
             if (genA && genA.innerText.trim()) return genA.innerText.trim();
         }
 
-        // 3. 详情页全局标题查找（1337x 详情页 h1、Nyaa 详情页 h3）
-        const h1337x = document.querySelector('.box-info-heading h1, .torrent-detail-page h1');
-        if (h1337x && h1337x.innerText.trim()) return h1337x.innerText.trim();
-
-        const nyaaHead = document.querySelector('.panel-heading .panel-title, h3.panel-title');
-        if (nyaaHead && nyaaHead.innerText.trim()) return nyaaHead.innerText.trim();
-
-        // 4. 目标元素自身或 title 属性
-        if (targetElement.title && targetElement.title.length > 5) return targetElement.title.trim();
-
-        const text = targetElement.innerText ? targetElement.innerText.trim() : '';
-        if (text && text.length > 4 && !/magnet|download|下载|磁链/i.test(text)) {
-            return text;
+        // 4. 详情页全局标题查找（1337x 详情页 h1、Nyaa 详情页 h3、论坛主题 h1 等）
+        const pageTitleEl = document.querySelector('.box-info-heading h1, .torrent-detail-page h1, .panel-heading .panel-title, h3.panel-title, h1.thread-title, h1#thread_subject, .subject h1, h1');
+        if (pageTitleEl && pageTitleEl.innerText.trim()) {
+            const hText = pageTitleEl.innerText.trim();
+            if (hText.length > 2 && hText.length < 150) return hText;
         }
 
-        // 5. 网页标题兜底
-        return document.title.replace(/ - (1337x|Nyaa|Sukebei|蜜柑计划).*$/i, '').trim() || '迅雷远程下载';
+        // 5. 目标元素自身或 title 属性
+        if (targetElement.title && targetElement.title.length > 5) return targetElement.title.trim();
+
+        if (directText && directText.length > 4 && !/magnet|download|下载|磁链/i.test(directText)) {
+            return directText;
+        }
+
+        // 6. 网页标题兜底
+        return document.title.replace(/ - (1337x|Nyaa|Sukebei|蜜柑计划|SeedHub).*$/i, '').trim() || '迅雷远程下载';
     }
 
     function request(options) {
@@ -762,17 +931,23 @@
         ) || el.parentElement || document.body;
     }
 
-    function addDownloadButton(targetElement, magnetLink) {
+    function addDownloadButton(targetElement, magnetLink, torrentUrl) {
         if (targetElement.dataset.xunleiProcessed) return;
 
+        let infoHash = magnetLink ? extractInfoHash(magnetLink) : '';
+        const torrentHashMap = GM_getValue('xl_torrent_hash_map', {});
+        if (!infoHash && torrentUrl && torrentHashMap[torrentUrl]) {
+            infoHash = torrentHashMap[torrentUrl];
+        }
+
         const title = extractSmartTitle(targetElement, magnetLink);
-        const infoHash = extractInfoHash(magnetLink);
         const history = GM_getValue('xl_pushed_hashes', {});
         const cachedItem = infoHash ? history[infoHash] : null;
 
         const button = document.createElement('button');
         button.className = 'xunlei-download-btn';
         button.dataset.hash = infoHash;
+        if (torrentUrl) button.dataset.torrentUrl = torrentUrl;
         button.dataset.taskTitle = title;
 
         // 自动识别场景模式：
@@ -895,7 +1070,20 @@
             button.style.backgroundColor = '#64748b';
 
             try {
-                const res = await pushDownloadTask(magnetLink, title);
+                let targetMagnet = magnetLink;
+                if (!targetMagnet && torrentUrl) {
+                    button.textContent = button.dataset.mode === 'icon' ? '⏳' : '⏳ 解析种子中...';
+                    const res = await resolveTorrentToMagnet(torrentUrl, title);
+                    targetMagnet = res.magnet;
+                    const resHash = res.infoHash;
+                    button.dataset.hash = resHash;
+                    const map = GM_getValue('xl_torrent_hash_map', {});
+                    map[torrentUrl] = resHash;
+                    GM_setValue('xl_torrent_hash_map', map);
+                }
+
+                button.textContent = button.dataset.mode === 'icon' ? '⏳' : '⏳ 推送中...';
+                const res = await pushDownloadTask(targetMagnet, title);
                 showToast(`已成功添加至群晖 [${res.name}]`, res.cleanName, 'success');
                 updateButtonState(button, 'DOWNLOADING', null, res.cleanName);
             } catch (err) {
@@ -916,11 +1104,181 @@
         targetElement.dataset.xunleiProcessed = 'true';
     }
 
-    function detectMagnetLinks() {
-        // 全面兼容各主流站点的磁力链接与图片/图标包装
-        const selector = 'a[href^="magnet:"], a[href*="magnet:?"], a[data-clipboard-text^="magnet:"], a[data-clipboard-text*="magnet:?"], button[data-clipboard-text^="magnet:"], a.js-magnet, a.magnet-link, [data-magnet]';
-        const directElements = Array.from(document.querySelectorAll(selector));
+    // -------------------------------------------------------------------------
+    // 多维磁链深度提取引擎（支持全属性解构、隐藏域、全局变量、源码扫描与 Base64 解码）
+    // -------------------------------------------------------------------------
+    function extractBase64MagnetsFromText(text) {
+        if (!text) return [];
+        const results = [];
+        // bWFnbmV0 是 "magnet" 的 Base64 编码特征前缀
+        const regex = /bWFnbmV0[a-zA-Z0-9+/=]{10,}/g;
+        let m;
+        while ((m = regex.exec(text)) !== null) {
+            try {
+                const decoded = atob(m[0]);
+                if (decoded && (decoded.startsWith('magnet:') || decoded.includes('magnet:?xt='))) {
+                    results.push(decoded);
+                }
+            } catch (e) {}
+        }
+        return results;
+    }
 
+    function extractMagnetFromElement(el) {
+        if (!el) return '';
+        // 1. 常见所有可能存放磁力链接的直接属性
+        const attrs = [
+            'data-clipboard-text', 'data-magnet', 'data-link', 'data-url', 
+            'data-href', 'data-copy', 'data-content', 'data-text', 
+            'value', 'href', 'onclick', 'data-original-title'
+        ];
+        for (const attr of attrs) {
+            const val = el.getAttribute ? el.getAttribute(attr) : '';
+            if (val && (val.includes('magnet:?') || val.startsWith('magnet:'))) {
+                const m = val.match(/magnet:\?[^\s"'<>]+/i);
+                if (m) return m[0];
+            }
+            if (val && val.includes('bWFnbmV0')) {
+                const decoded = extractBase64MagnetsFromText(val);
+                if (decoded.length > 0) return decoded[0];
+            }
+        }
+        // 2. dataset 扫描
+        if (el.dataset) {
+            for (const k of Object.keys(el.dataset)) {
+                const val = el.dataset[k];
+                if (typeof val === 'string' && (val.includes('magnet:?') || val.startsWith('magnet:'))) {
+                    const m = val.match(/magnet:\?[^\s"'<>]+/i);
+                    if (m) return m[0];
+                }
+                if (typeof val === 'string' && val.includes('bWFnbmV0')) {
+                    const decoded = extractBase64MagnetsFromText(val);
+                    if (decoded.length > 0) return decoded[0];
+                }
+            }
+        }
+        // 3. 关联目标（Clipboard.js / Bootstrap data-target 模式）
+        const targetSel = el.getAttribute ? (el.getAttribute('data-clipboard-target') || el.getAttribute('data-target')) : '';
+        if (targetSel) {
+            try {
+                const targetEl = document.querySelector(targetSel);
+                if (targetEl) {
+                    const targetVal = targetEl.value || targetEl.innerText || targetEl.textContent || '';
+                    const m = targetVal.match(/magnet:\?[^\s"'<>]+/i);
+                    if (m) return m[0];
+                    const decoded = extractBase64MagnetsFromText(targetVal);
+                    if (decoded.length > 0) return decoded[0];
+                }
+            } catch (e) {}
+        }
+        return '';
+    }
+
+    function findGlobalMagnetFromPage() {
+        // 1. 检查全局作用域原生变量（如 SeedHub 的 panLink 等）
+        const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        if (win) {
+            for (const key of ['panLink', 'magnetLink', 'magnet', 'downloadUrl', 'seedLink', 'targetLink', 'downUrl', 'data']) {
+                try {
+                    const val = win[key];
+                    if (val && typeof val === 'string') {
+                        if (val.includes('magnet:?') || val.startsWith('magnet:')) {
+                            const m = val.match(/magnet:\?[^\s"'<>]+/i);
+                            if (m) return m[0];
+                        }
+                        if (val.includes('bWFnbmV0')) {
+                            const decoded = extractBase64MagnetsFromText(val);
+                            if (decoded.length > 0) return decoded[0];
+                        }
+                    }
+                } catch (e) {}
+            }
+        }
+
+        // 2. 扫描整页 input/textarea 隐藏表单
+        const inputs = document.querySelectorAll('input, textarea');
+        for (const inp of inputs) {
+            const val = inp.value || '';
+            if (val && val.includes('magnet:?xt=urn:btih:')) {
+                const m = val.match(/magnet:\?[^\s"'<>]+/i);
+                if (m) return m[0];
+            }
+            if (val && val.includes('bWFnbmV0')) {
+                const decoded = extractBase64MagnetsFromText(val);
+                if (decoded.length > 0) return decoded[0];
+            }
+        }
+
+        // 3. 整页 HTML 源代码与 script 块明文正则直扫
+        try {
+            const fullHtml = document.documentElement ? document.documentElement.innerHTML : '';
+            if (fullHtml && fullHtml.includes('magnet:?xt=urn:btih:')) {
+                const m = fullHtml.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]+[^\s"'<>\\`]+/i);
+                if (m) return m[0];
+            }
+        } catch (e) {}
+
+        // 4. 整页内联 script 块及源码中的 Base64 混淆特征扫描（如 SeedHub 的 const data = "bWFnbmV0..."）
+        try {
+            const scripts = document.querySelectorAll('script:not([src])');
+            for (const sc of scripts) {
+                const code = sc.textContent || '';
+                const decodedList = extractBase64MagnetsFromText(code);
+                if (decodedList.length > 0) return decodedList[0];
+            }
+            const fullHtml = document.documentElement ? document.documentElement.innerHTML : '';
+            const decodedList = extractBase64MagnetsFromText(fullHtml);
+            if (decodedList.length > 0) return decodedList[0];
+        } catch (e) {}
+
+        return '';
+    }
+
+    // 通用语义化查找：精准定位页面中充当“复制磁力/下载磁力”的交互按钮或叶子元素（支持 button, a, div, span 等任何标签）
+    function findCopyMagnetButtons() {
+        const results = [];
+        const candidates = document.querySelectorAll('button, a, div, span, p, input, [role="button"], [class*="btn"], [class*="copy"], [id*="copy"], [class*="magnet"], [id*="magnet"], [id="thunder"]');
+        for (const el of candidates) {
+            if (el.classList && el.classList.contains('xunlei-download-btn')) continue;
+            if (el.dataset.xunleiProcessed) continue;
+
+            const text = (el.innerText || el.textContent || el.value || '').trim();
+            if (!text || text.length > 25) continue;
+
+            if (/复制磁力|下载磁力|磁力下载|复制magnet|拷贝磁力|磁力链接|获取磁力|迅雷高速下载/i.test(text)) {
+                // 确保选取最底层的叶子按钮元素，避免挂载于外层大容器上
+                const hasMatchingChild = Array.from(el.children).some(child => {
+                    const cText = (child.innerText || child.textContent || '').trim();
+                    return /复制磁力|下载磁力|磁力下载|复制magnet|拷贝磁力|磁力链接|获取磁力|迅雷高速下载/i.test(cText);
+                });
+                if (!hasMatchingChild) {
+                    results.push(el);
+                }
+            }
+        }
+        return results;
+    }
+
+    function detectMagnetLinks() {
+        // 全面兼容全网磁力链接形式（带 href、纯 data 属性、隐藏域或按钮）
+        const selector = [
+            'a[href^="magnet:"]',
+            'a[href*="magnet:?"]',
+            '[data-clipboard-text*="magnet:?"]',
+            '[data-magnet*="magnet:?"]',
+            '[data-link*="magnet:?"]',
+            '[data-url*="magnet:?"]',
+            '[data-href*="magnet:?"]',
+            '[data-copy*="magnet:?"]',
+            '[data-content*="magnet:?"]',
+            '[value*="magnet:?"]',
+            '[onclick*="magnet:?"]',
+            'a.js-magnet',
+            'a.magnet-link',
+            '[data-magnet]'
+        ].join(', ');
+
+        const directElements = Array.from(document.querySelectorAll(selector));
         let foundAny = false;
         const candidateMap = new Map();
 
@@ -930,11 +1288,7 @@
                 return;
             }
 
-            let mag = el.getAttribute('data-clipboard-text') || el.getAttribute('data-magnet') || el.href || '';
-            if (!mag.includes('magnet:?') && el.dataset.clipboardText) {
-                mag = el.dataset.clipboardText;
-            }
-
+            const mag = extractMagnetFromElement(el);
             if (!mag || (!mag.startsWith('magnet:') && !mag.includes('magnet:?xt='))) return;
 
             const infoHash = extractInfoHash(mag);
@@ -957,6 +1311,60 @@
                 candidateMap.set(groupKey, { el, mag, score, container, infoHash });
             }
         });
+
+        // ---------------------------------------------------------------------
+        // 语义化增强扫描：针对类似 SeedHub 等无直接 href 属性的“复制磁力”按钮
+        // ---------------------------------------------------------------------
+        const semanticButtons = findCopyMagnetButtons();
+        if (semanticButtons.length > 0) {
+            // 预先提取页面全局可能存在的磁链
+            const globalMag = findGlobalMagnetFromPage();
+
+            semanticButtons.forEach(btn => {
+                if (btn.dataset.xunleiProcessed || btn.classList.contains('xunlei-download-btn')) return;
+
+                // 1. 先从自身所有属性提取
+                let mag = extractMagnetFromElement(btn);
+
+                // 2. 若自身无属性，向其父级容器搜寻隐藏的 input、textarea、code、pre 等
+                if (!mag) {
+                    const container = findItemContainer(btn);
+                    if (container) {
+                        const candidates = container.querySelectorAll('input, textarea, code, pre, [data-link], [data-url], [data-magnet]');
+                        for (const item of candidates) {
+                            const val = item.value || extractMagnetFromElement(item) || item.innerText || item.textContent || '';
+                            const m = val.match(/magnet:\?[^\s"'<>]+/i);
+                            if (m) {
+                                mag = m[0];
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 3. 使用整页全局提取的磁链
+                if (!mag && globalMag) {
+                    mag = globalMag;
+                }
+
+                if (mag) {
+                    const infoHash = extractInfoHash(mag);
+                    if (!infoHash) return;
+                    const container = findItemContainer(btn);
+                    if (container.querySelector(`.xunlei-download-btn[data-hash="${infoHash}"]`)) return;
+
+                    if (!container.dataset.xlId) {
+                        container.dataset.xlId = 'xl_' + Math.random().toString(36).slice(2, 9);
+                    }
+                    const groupKey = `${infoHash}_${container.dataset.xlId}`;
+                    // 赋予这类明确的按钮最高优先级评分，确保精准挂载于其右侧
+                    const score = 280;
+                    if (!candidateMap.has(groupKey) || candidateMap.get(groupKey).score < score) {
+                        candidateMap.set(groupKey, { el: btn, mag, score, container, infoHash });
+                    }
+                }
+            });
+        }
 
         candidateMap.forEach(({ el, mag, container, infoHash }) => {
             if (!container.querySelector(`.xunlei-download-btn[data-hash="${infoHash}"]`)) {
@@ -1009,8 +1417,113 @@
             }
         });
 
+        // ---------------------------------------------------------------------
+        // 种子文件与论坛附件扫描（全面兼容 1lou、NexusPHP、Discuz 等各站点 .torrent）
+        // ---------------------------------------------------------------------
+        const torrentSelectors = [
+            'a[href*=".torrent"]',
+            'a[href*="attach-download-"]',
+            'a[href*="attachment.php?"]',
+            'a[href*="download.php?"]',
+            'a[href*="/torrent/"]',
+            'a[href*="/download/"]',
+            'a[download*=".torrent"]'
+        ].join(', ');
+
+        const torrentLinks = Array.from(document.querySelectorAll(torrentSelectors));
+        // 补充扫描：链接文本以 .torrent 结尾的超链接
+        document.querySelectorAll('a').forEach(a => {
+            if (!torrentLinks.includes(a)) {
+                const text = (a.innerText || a.textContent || '').trim();
+                if (/\.torrent$/i.test(text)) {
+                    torrentLinks.push(a);
+                }
+            }
+        });
+
+        const activeTorrentHashMap = GM_getValue('xl_torrent_hash_map', {});
+
+        torrentLinks.forEach(el => {
+            if (el.dataset.xunleiProcessed) return;
+
+            // 过滤：包裹性超链接
+            if (el.querySelector('div, p, table, ul, ol, section')) return;
+
+            const href = el.getAttribute('href') || el.href || '';
+            if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+            if (href.startsWith('magnet:') || href.includes('magnet:?xt=')) return;
+
+            let fullUrl = href;
+            try {
+                fullUrl = new URL(href, window.location.href).href;
+            } catch(e) {}
+
+            const container = findItemContainer(el);
+            const knownHash = activeTorrentHashMap[fullUrl];
+            if (knownHash && container.querySelector(`.xunlei-download-btn[data-hash="${knownHash}"]`)) {
+                return;
+            }
+            if (container.querySelector(`.xunlei-download-btn[data-torrent-url="${fullUrl}"]`)) {
+                return;
+            }
+
+            addDownloadButton(el, '', fullUrl);
+            foundAny = true;
+        });
+
         return foundAny;
     }
+
+    // -------------------------------------------------------------------------
+    // 动态剪贴板与原生 API 劫持兜底：当页面纯靠 JS 点击复制时，0毫秒捕获挂载
+    // -------------------------------------------------------------------------
+    let lastClickedTarget = null;
+    document.addEventListener('click', (e) => {
+        const target = e.target;
+        if (target && target.nodeType === Node.ELEMENT_NODE) {
+            lastClickedTarget = target.closest('button, a, div, span, [role="button"], input') || target;
+        }
+    }, true);
+
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            const originalWriteText = navigator.clipboard.writeText;
+            navigator.clipboard.writeText = function (text) {
+                try {
+                    if (typeof text === 'string' && (text.includes('magnet:?') || text.startsWith('magnet:'))) {
+                        const m = text.match(/magnet:\?[^\s"'<>]+/i);
+                        if (m) {
+                            const mag = m[0];
+                            const targetBtn = lastClickedTarget || document.querySelector('button, a, span, div');
+                            if (targetBtn && !targetBtn.dataset.xunleiProcessed) {
+                                setTimeout(() => {
+                                    const infoHash = extractInfoHash(mag);
+                                    const container = findItemContainer(targetBtn);
+                                    if (!container.querySelector(`.xunlei-download-btn[data-hash="${infoHash}"]`)) {
+                                        addDownloadButton(targetBtn, mag);
+                                    }
+                                }, 50);
+                            }
+                        }
+                    }
+                } catch (err) {}
+                return originalWriteText.apply(this, arguments);
+            };
+        }
+    } catch (e) {}
+
+    document.addEventListener('copy', (e) => {
+        try {
+            setTimeout(() => {
+                const target = lastClickedTarget || e.target;
+                if (!target) return;
+                const btn = target.closest ? target.closest('button, a, div, span, .btn, .button') : null;
+                if (btn && !btn.dataset.xunleiProcessed) {
+                    detectMagnetLinks();
+                }
+            }, 100);
+        } catch (err) {}
+    }, true);
 
     // 初始化检测与定时扫描
     setInterval(detectMagnetLinks, 1500);
