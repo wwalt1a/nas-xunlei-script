@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         迅雷下载助手脚本版
 // @namespace    https://github.com/saaak/xunlei-docker-ext
-// @version      1.3.0
+// @version      1.3.1
 // @description  基于 saaak/xunlei-docker-ext 扩展移植重构，专为迅雷 NAS (群晖 DSM / Docker / 威联通 QNAP) 与 Firefox / Chrome 深度适配。一键抓取全网磁力链接推送到远程 NAS，支持双向下载状态实时同步与目录平铺直存。
 // @author       Community
 // @license      MIT
@@ -705,6 +705,31 @@
     // -------------------------------------------------------------------------
     // 磁力链接识别、全网智能挂载与交互
     // -------------------------------------------------------------------------
+    function getElementScore(el) {
+        let score = 0;
+        // 1. 优先挂载于真正的按钮或输入框
+        if (el.tagName === 'BUTTON' || el.tagName === 'INPUT') score += 100;
+        // 2. 携带按钮相关 class
+        const cls = (el.className || '').toLowerCase();
+        if (cls.includes('btn') || cls.includes('button') || cls.includes('copy') || cls.includes('download')) score += 50;
+        // 3. 处于按钮群组容器中
+        if (el.closest('.buttons, .btn-group, .actions, .magnet-actions, .download-buttons, td.coll-1')) score += 40;
+        // 4. 短文本或图标专属链接（如磁力图标）
+        const textLen = (el.textContent || '').trim().length;
+        if (textLen <= 10) score += 30;
+        // 5. 严重惩罚：包裹性父级超链接（内部包含 div, p, tags 等排版块）
+        if (el.querySelector('div, p, table, ul, ol, section')) score -= 150;
+        // 6. 惩罚长文本（通常为整行条目标题，不适合插入内联按钮）
+        if (textLen > 40) score -= 80;
+        return score;
+    }
+
+    function findItemContainer(el) {
+        return el.closest(
+            'tr, li, .item, .torrent-item, .magnet-row, .row, .torrent_row, .gl-item, .list-item, [data-rank], .magnet-links-item, .box, article'
+        ) || el.parentElement || document.body;
+    }
+
     function addDownloadButton(targetElement, magnetLink) {
         if (targetElement.dataset.xunleiProcessed) return;
 
@@ -716,12 +741,22 @@
         const button = document.createElement('button');
         button.className = 'xunlei-download-btn';
         button.dataset.hash = infoHash;
+
+        // 针对 Bulma / Bootstrap 等常见 CSS 框架的按键群组优化
+        if (targetElement.classList && targetElement.classList.contains('button')) {
+            button.classList.add('button', 'is-small');
+        } else if (targetElement.classList && targetElement.classList.contains('btn')) {
+            button.classList.add('btn', 'btn-sm');
+        }
+
         button.style.cssText = `
-            margin-left: 6px; padding: 2px 8px; border-radius: 4px;
-            font-size: 11px; font-weight: 500; cursor: pointer;
-            line-height: 1.4; display: inline-block; vertical-align: middle;
+            margin: 0 4px; padding: 2px 8px; border-radius: 4px;
+            font-size: 11px; font-weight: 600; cursor: pointer;
+            height: 24px; min-height: 24px; line-height: 22px;
+            display: inline-flex; align-items: center; justify-content: center;
+            vertical-align: middle; flex-shrink: 0; box-sizing: border-box;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            white-space: nowrap; box-sizing: border-box; transition: all 0.2s ease;
+            white-space: nowrap; transition: all 0.2s ease;
             box-shadow: 0 1px 2px rgba(0,0,0,0.08); border: 1px solid #0369a1;
             background-color: #0284c7; color: #ffffff; text-decoration: none;
         `;
@@ -795,36 +830,56 @@
             }
         });
 
-        // 智能插入位置：如果是纯图标，插在其父级之后或紧随其后
-        if (targetElement.nextSibling) {
-            targetElement.parentNode.insertBefore(button, targetElement.nextSibling);
-        } else {
-            targetElement.parentNode.appendChild(button);
-        }
+        // 插入在目标按钮之后
+        targetElement.insertAdjacentElement('afterend', button);
         targetElement.dataset.xunleiProcessed = 'true';
     }
 
     function detectMagnetLinks() {
         // 全面兼容各主流站点的磁力链接与图片/图标包装
         const selector = 'a[href^="magnet:"], a[href*="magnet:?"], a[data-clipboard-text^="magnet:"], a[data-clipboard-text*="magnet:?"], button[data-clipboard-text^="magnet:"], a.js-magnet, a.magnet-link, [data-magnet]';
-        const directElements = document.querySelectorAll(selector);
+        const directElements = Array.from(document.querySelectorAll(selector));
 
         let foundAny = false;
-        directElements.forEach(el => {
-            if (el.dataset.xunleiProcessed) return;
+        const candidateMap = new Map();
 
+        directElements.forEach(el => {
             let mag = el.getAttribute('data-clipboard-text') || el.getAttribute('data-magnet') || el.href || '';
             if (!mag.includes('magnet:?') && el.dataset.clipboardText) {
                 mag = el.dataset.clipboardText;
             }
 
-            if (mag && (mag.startsWith('magnet:') || mag.includes('magnet:?xt='))) {
+            if (!mag || (!mag.startsWith('magnet:') && !mag.includes('magnet:?xt='))) return;
+
+            const infoHash = extractInfoHash(mag);
+            if (!infoHash) return;
+
+            const container = findItemContainer(el);
+
+            // 若该容器条目内已经成功挂载过该哈希的按钮，坚决不再重复挂载
+            if (container.querySelector(`.xunlei-download-btn[data-hash="${infoHash}"]`)) {
+                return;
+            }
+
+            if (!container.dataset.xlId) {
+                container.dataset.xlId = 'xl_' + Math.random().toString(36).slice(2, 9);
+            }
+            const groupKey = `${infoHash}_${container.dataset.xlId}`;
+
+            const score = getElementScore(el);
+            if (!candidateMap.has(groupKey) || candidateMap.get(groupKey).score < score) {
+                candidateMap.set(groupKey, { el, mag, score, container, infoHash });
+            }
+        });
+
+        candidateMap.forEach(({ el, mag, container, infoHash }) => {
+            if (!container.querySelector(`.xunlei-download-btn[data-hash="${infoHash}"]`)) {
                 foundAny = true;
                 addDownloadButton(el, mag);
             }
         });
 
-        // 纯文本节点磁链扫描
+        // 纯文本节点磁链扫描（仅对未包裹超链接的纯文本磁链生效）
         const magnetRegex = /magnet:\?[^\s<>"']+/gi;
         const walker = document.createTreeWalker(
             document.body,
@@ -832,6 +887,7 @@
             {
                 acceptNode: function(node) {
                     if (node.parentElement && (node.parentElement.dataset.xunleiProcessed || 
+                        node.parentElement.classList.contains('xunlei-download-btn') ||
                         ['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA', 'BUTTON'].includes(node.parentElement.tagName))) {
                         return NodeFilter.FILTER_REJECT;
                     }
@@ -852,6 +908,11 @@
             const matches = textNode.textContent.match(magnetRegex);
             if (matches && textNode.parentElement && !textNode.parentElement.dataset.xunleiProcessed) {
                 matches.forEach(magnetLink => {
+                    const infoHash = extractInfoHash(magnetLink);
+                    const container = findItemContainer(textNode.parentElement);
+                    if (container && container.querySelector(`.xunlei-download-btn[data-hash="${infoHash}"]`)) {
+                        return;
+                    }
                     foundAny = true;
                     const span = document.createElement('span');
                     span.style.cssText = 'display: inline-block; margin: 0 4px;';
