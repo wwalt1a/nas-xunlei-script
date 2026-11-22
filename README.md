@@ -1,6 +1,6 @@
 # 迅雷下载助手脚本版 (nas-xunlei-script)
 
-专为迅雷 NAS (群晖 DSM / Docker / 威联通 QNAP) 与 Firefox / Chrome 用户适配的油猴脚本，支持全网磁力链接一键直推远程设备，具备双向任务状态感知与目录平铺直存特性。
+专为迅雷 NAS (群晖 DSM / Docker / 威联通 QNAP) 与 Firefox / Chrome 用户适配的油猴脚本，支持全网磁力链接与种子附件（.torrent）一键直推远程设备，具备双向任务状态感知与目录平铺直存特性。
 
 ---
 
@@ -44,7 +44,7 @@ chrome.storage.local.get(['xl_refresh_token'], res => console.log(res.xl_refresh
 ## 🚀 绑定与推送使用
 
 1. 点击上方 CDN 链接完成安装；
-2. 打开任意资源站点（如蜜柑计划 Mikanani、1337x、Nyaa、Sukebei 等）；
+2. 打开任意资源站点（如蜜柑计划 Mikanani、1337x、Nyaa、1LOU 论坛种子、SeedHub、JavDB 等）；
 3. 找到资源条目，点击新增的 **「⚡ 迅雷直推」** 按钮；
 4. 首次使用时会弹出轻量设置窗口，粘贴以 `a1.` 开头的凭证并保存；
 5. 脚本将自动识别并连接在线的 NAS 设备，后续点击即可秒速直推，并实时同步下载百分比与完成状态！
