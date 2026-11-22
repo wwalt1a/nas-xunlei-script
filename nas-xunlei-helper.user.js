@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         迅雷下载助手脚本版
 // @namespace    https://github.com/saaak/xunlei-docker-ext
-// @version      1.3.1
+// @version      1.3.2
 // @description  基于 saaak/xunlei-docker-ext 扩展移植重构，专为迅雷 NAS (群晖 DSM / Docker / 威联通 QNAP) 与 Firefox / Chrome 深度适配。一键抓取全网磁力链接推送到远程 NAS，支持双向下载状态实时同步与目录平铺直存。
 // @author       Community
 // @license      MIT
@@ -460,37 +460,69 @@
     // -------------------------------------------------------------------------
     // 状态管理引擎：与群晖 NAS 任务生命周期双向同步
     // -------------------------------------------------------------------------
-    function updateButtonState(btn, state, progress) {
+    function updateButtonState(btn, state, progress, taskTitle) {
         btn.dataset.state = state;
+        const mode = btn.dataset.mode || 'normal';
+        const rawTitle = taskTitle || btn.dataset.taskTitle || '';
+        if (taskTitle) btn.dataset.taskTitle = taskTitle;
+
         if (state === 'COMPLETE') {
             btn.dataset.pushed = 'true';
-            btn.textContent = '✔ 已完成';
             btn.style.backgroundColor = '#059669'; // 翡翠绿
             btn.style.borderColor = '#047857';
             btn.style.color = '#ffffff';
-            btn.title = '群晖 NAS 已完整下载入库！点击可选择重新推送下载';
+
+            if (mode === 'icon') {
+                btn.textContent = '✔';
+            } else if (mode === 'group') {
+                btn.textContent = '✔ 完成';
+            } else {
+                btn.textContent = '✔ 已完成';
+            }
+            btn.title = `【迅雷 NAS 已入库】${rawTitle ? `任务名: ${rawTitle}\n` : ''}该资源此前已下载完成，点击可选择重新推送。`;
         } else if (state === 'DOWNLOADING') {
             btn.dataset.pushed = 'true';
-            const progressText = (progress !== undefined && progress !== null && progress > 0) ? ` ${progress}%` : '';
-            btn.textContent = `⏳ 正在下载${progressText}`;
             btn.style.backgroundColor = '#d97706'; // 暖橙色
             btn.style.borderColor = '#b45309';
             btn.style.color = '#ffffff';
-            btn.title = '任务正在群晖 NAS 下载中...';
+
+            const pct = (progress !== undefined && progress !== null && progress > 0) ? `${progress}%` : '';
+            if (mode === 'icon') {
+                btn.textContent = '⏳';
+            } else if (mode === 'group') {
+                btn.textContent = pct ? `⏳ ${pct}` : '⏳ 下载中';
+            } else {
+                btn.textContent = `⏳ 正在下载 ${pct}`.trim();
+            }
+            btn.title = `【迅雷 NAS 下载中 ${pct}】${rawTitle ? `任务名: ${rawTitle}\n` : ''}点击可强制重新提交。`;
         } else if (state === 'ERROR') {
             btn.dataset.pushed = 'false';
-            btn.textContent = '❌ 下载异常';
             btn.style.backgroundColor = '#dc2626';
             btn.style.borderColor = '#b91c1c';
             btn.style.color = '#ffffff';
-            btn.title = '群晖端下载遇到异常，点击可重试';
+
+            if (mode === 'icon') {
+                btn.textContent = '❌';
+            } else if (mode === 'group') {
+                btn.textContent = '❌ 异常';
+            } else {
+                btn.textContent = '❌ 下载异常';
+            }
+            btn.title = `【迅雷 NAS 下载异常】${rawTitle ? `任务名: ${rawTitle}\n` : ''}点击可重试。`;
         } else { // INITIAL
             btn.dataset.pushed = 'false';
-            btn.textContent = '⚡ 迅雷直推';
             btn.style.backgroundColor = '#0284c7';
             btn.style.borderColor = '#0369a1';
             btn.style.color = '#ffffff';
-            btn.title = '一键推送到迅雷 NAS';
+
+            if (mode === 'icon') {
+                btn.textContent = '⚡';
+            } else if (mode === 'group') {
+                btn.textContent = '⚡ 迅雷';
+            } else {
+                btn.textContent = '⚡ 迅雷直推';
+            }
+            btn.title = `【迅雷 NAS 一键直推】${rawTitle ? `任务名: ${rawTitle}\n` : ''}点击推送到远程 NAS 下载根目录。`;
         }
     }
 
@@ -546,11 +578,11 @@
                     const info = nasMap.get(hash);
                     history[hash] = { title: info.name, time: Date.now(), phase: info.phase };
                     if (info.phase === 'PHASE_TYPE_COMPLETE') {
-                        updateButtonState(btn, 'COMPLETE');
+                        updateButtonState(btn, 'COMPLETE', null, info.name);
                     } else if (info.phase === 'PHASE_TYPE_RUNNING' || info.phase === 'PHASE_TYPE_PENDING') {
-                        updateButtonState(btn, 'DOWNLOADING', info.progress);
+                        updateButtonState(btn, 'DOWNLOADING', info.progress, info.name);
                     } else if (info.phase === 'PHASE_TYPE_ERROR') {
-                        updateButtonState(btn, 'ERROR');
+                        updateButtonState(btn, 'ERROR', null, info.name);
                     }
                 } else {
                     if (history[hash]) {
@@ -741,36 +773,85 @@
         const button = document.createElement('button');
         button.className = 'xunlei-download-btn';
         button.dataset.hash = infoHash;
+        button.dataset.taskTitle = title;
 
-        // 针对 Bulma / Bootstrap 等常见 CSS 框架的按键群组优化
-        if (targetElement.classList && targetElement.classList.contains('button')) {
-            button.classList.add('button', 'is-small');
-        } else if (targetElement.classList && targetElement.classList.contains('btn')) {
-            button.classList.add('btn', 'btn-sm');
+        // 自动识别场景模式：
+        // 1. icon 模式：紧凑表格列（The Pirate Bay 的 .item-icons、td.coll-1、td.text-center、纯图标链接、宽度 <= 85px 紧凑单元格）
+        const isIconMode = Boolean(
+            targetElement.closest('.item-icons, #torrents .item-icons, td.coll-1, td.text-center') ||
+            targetElement.tagName === 'IMG' ||
+            targetElement.tagName === 'SVG' ||
+            (targetElement.parentElement && targetElement.parentElement.classList && targetElement.parentElement.classList.contains('item-icons')) ||
+            (targetElement.offsetWidth > 0 && targetElement.offsetWidth <= 32 && !targetElement.textContent.trim())
+        );
+
+        // 2. group 模式：处于框架按钮群组中（JavDB 的 .buttons、Bootstrap .btn-group、Bulma 按钮群）
+        const isGroupMode = !isIconMode && Boolean(
+            targetElement.closest('.buttons, .btn-group, .actions, .magnet-actions, .download-buttons') ||
+            (targetElement.classList && (targetElement.classList.contains('button') || targetElement.classList.contains('btn')))
+        );
+
+        const mode = isIconMode ? 'icon' : (isGroupMode ? 'group' : 'normal');
+        button.dataset.mode = mode;
+
+        // 针对 Bulma / Bootstrap 等常见 CSS 框架的按键群组继承原生类
+        if (isGroupMode) {
+            if (targetElement.classList && targetElement.classList.contains('button')) {
+                button.classList.add('button', 'is-small');
+            } else if (targetElement.classList && targetElement.classList.contains('btn')) {
+                button.classList.add('btn', 'btn-sm');
+            }
         }
 
-        button.style.cssText = `
-            margin: 0 4px; padding: 2px 8px; border-radius: 4px;
-            font-size: 11px; font-weight: 600; cursor: pointer;
-            height: 24px; min-height: 24px; line-height: 22px;
-            display: inline-flex; align-items: center; justify-content: center;
-            vertical-align: middle; flex-shrink: 0; box-sizing: border-box;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            white-space: nowrap; transition: all 0.2s ease;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.08); border: 1px solid #0369a1;
-            background-color: #0284c7; color: #ffffff; text-decoration: none;
-        `;
+        if (mode === 'icon') {
+            button.style.cssText = `
+                display: inline-flex; align-items: center; justify-content: center;
+                width: 22px; min-width: 22px; max-width: 22px;
+                height: 18px; min-height: 18px; max-height: 18px;
+                padding: 0; margin: 0 0 0 3px;
+                border-radius: 3px; font-size: 11px; font-weight: 600;
+                line-height: 16px; cursor: pointer; vertical-align: middle;
+                box-sizing: border-box; flex-shrink: 0;
+                background-color: #0284c7; color: #ffffff;
+                border: 1px solid #0369a1; box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+                transition: all 0.2s ease; text-decoration: none;
+            `;
+        } else if (mode === 'group') {
+            button.style.cssText = `
+                display: inline-flex; align-items: center; justify-content: center;
+                padding: 0 6px; margin: 0 2px;
+                height: 24px; min-height: 24px;
+                border-radius: 3px; font-size: 11px; font-weight: 600;
+                line-height: 22px; cursor: pointer; vertical-align: middle;
+                box-sizing: border-box; flex-shrink: 0; white-space: nowrap;
+                background-color: #0284c7; color: #ffffff;
+                border: 1px solid #0369a1; box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+                transition: all 0.2s ease; text-decoration: none;
+            `;
+        } else {
+            button.style.cssText = `
+                display: inline-flex; align-items: center; justify-content: center;
+                margin: 0 4px; padding: 2px 8px; border-radius: 4px;
+                font-size: 11px; font-weight: 600; cursor: pointer;
+                height: 24px; min-height: 24px; line-height: 22px;
+                vertical-align: middle; flex-shrink: 0; box-sizing: border-box;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                white-space: nowrap; transition: all 0.2s ease;
+                box-shadow: 0 1px 2px rgba(0,0,0,0.08); border: 1px solid #0369a1;
+                background-color: #0284c7; color: #ffffff; text-decoration: none;
+            `;
+        }
 
         if (cachedItem) {
             if (cachedItem.phase === 'PHASE_TYPE_COMPLETE') {
-                updateButtonState(button, 'COMPLETE');
+                updateButtonState(button, 'COMPLETE', null, title);
             } else if (cachedItem.phase === 'PHASE_TYPE_ERROR') {
-                updateButtonState(button, 'ERROR');
+                updateButtonState(button, 'ERROR', null, title);
             } else {
-                updateButtonState(button, 'COMPLETE');
+                updateButtonState(button, 'COMPLETE', null, title);
             }
         } else {
-            updateButtonState(button, 'INITIAL');
+            updateButtonState(button, 'INITIAL', null, title);
         }
 
         button.onmouseover = () => {
@@ -810,13 +891,13 @@
 
             button.disabled = true;
             const originalText = button.textContent;
-            button.textContent = '⏳ 提交中...';
+            button.textContent = button.dataset.mode === 'icon' ? '⏳' : '⏳ 提交中...';
             button.style.backgroundColor = '#64748b';
 
             try {
                 const res = await pushDownloadTask(magnetLink, title);
                 showToast(`已成功添加至群晖 [${res.name}]`, res.cleanName, 'success');
-                updateButtonState(button, 'DOWNLOADING');
+                updateButtonState(button, 'DOWNLOADING', null, res.cleanName);
             } catch (err) {
                 if (err.message === 'AUTH_REQUIRED') {
                     showConfigModal();
@@ -824,7 +905,7 @@
                     showToast('推送失败', err.message || '未知错误', 'error');
                 }
                 button.textContent = originalText;
-                updateButtonState(button, button.dataset.state || 'INITIAL');
+                updateButtonState(button, button.dataset.state || 'INITIAL', null, title);
             } finally {
                 button.disabled = false;
             }
@@ -844,6 +925,11 @@
         const candidateMap = new Map();
 
         directElements.forEach(el => {
+            // 严格过滤：若该元素是一个包裹性超链接（包含 div, p, .tags, .meta, .name 等复杂排版块），坚决不挂载于其后！
+            if (el.tagName === 'A' && el.querySelector('div, p, table, ul, ol, section, .tags, .meta, .name, .tag')) {
+                return;
+            }
+
             let mag = el.getAttribute('data-clipboard-text') || el.getAttribute('data-magnet') || el.href || '';
             if (!mag.includes('magnet:?') && el.dataset.clipboardText) {
                 mag = el.dataset.clipboardText;
