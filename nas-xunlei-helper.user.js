@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         迅雷下载助手脚本版
 // @namespace    https://github.com/saaak/xunlei-docker-ext
-// @version      1.4.0
+// @version      1.4.1
 // @description  基于 saaak/xunlei-docker-ext 扩展移植重构，专为迅雷 NAS (群晖 DSM / Docker / 威联通 QNAP) 与 Firefox / Chrome 深度适配。一键抓取全网磁力链接与种子文件（.torrent）推送到远程 NAS，支持双向下载状态实时同步与目录平铺直存。
 // @author       Community
 // @license      MIT

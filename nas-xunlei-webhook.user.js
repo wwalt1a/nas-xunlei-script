@@ -2,7 +2,7 @@
 // @name         nas-xunlei-webhook
 // @name:zh-CN   迅雷下载助手 (Webhook 版)
 // @namespace    https://github.com/wwalt1a/nas-xunlei-script
-// @version      1.0.0
+// @version      1.0.1
 // @description  专为群晖 DSM (lwlook/webhook) 与 iOS 快捷指令协同打造的轻量化下载助手。浏览器端零 Token 鉴权，直接将全网磁链与种子附件通过 Webhook 直推到远程群晖迅雷套件，彻底杜绝 Token 冲突与失效问题。
 // @author       Community
 // @license      MIT
