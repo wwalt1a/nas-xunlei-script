@@ -79,6 +79,160 @@
         return match ? match[1].toLowerCase() : '';
     }
 
+    // -------------------------------------------------------------------------
+    // 工具函数：SHA-1 计算与 Bencode 种子解析引擎（无第三方依赖，纯原生实现）
+    // -------------------------------------------------------------------------
+    function sha1(bytes) {
+        if (typeof bytes === 'string') {
+            bytes = new TextEncoder().encode(bytes);
+        }
+        const len = bytes.length;
+        const totalWords = (((len + 8) >> 6) + 1) * 16;
+        const words = new Int32Array(totalWords);
+        for (let i = 0; i < len; i++) {
+            words[i >> 2] |= bytes[i] << (24 - (i % 4) * 8);
+        }
+        words[len >> 2] |= 0x80 << (24 - (len % 4) * 8);
+        words[totalWords - 2] = Math.floor((len * 8) / 0x100000000);
+        words[totalWords - 1] = (len * 8) >>> 0;
+
+        let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;
+        const w = new Int32Array(80);
+
+        for (let i = 0; i < totalWords; i += 16) {
+            for (let j = 0; j < 16; j++) w[j] = words[i + j];
+            for (let j = 16; j < 80; j++) {
+                const val = w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16];
+                w[j] = (val << 1) | (val >>> 31);
+            }
+
+            let a = h0, b = h1, c = h2, d = h3, e = h4;
+            for (let j = 0; j < 80; j++) {
+                let f, k;
+                if (j < 20) {
+                    f = (b & c) | ((~b) & d);
+                    k = 0x5A827999;
+                } else if (j < 40) {
+                    f = b ^ c ^ d;
+                    k = 0x6ED9EBA1;
+                } else if (j < 60) {
+                    f = (b & c) | (b & d) | (c & d);
+                    k = 0x8F1BBCDC;
+                } else {
+                    f = b ^ c ^ d;
+                    k = 0xCA62C1D6;
+                }
+                const temp = (((a << 5) | (a >>> 27)) + f + e + k + w[j]) | 0;
+                e = d;
+                d = c;
+                c = ((b << 30) | (b >>> 2)) | 0;
+                b = a;
+                a = temp;
+            }
+
+            h0 = (h0 + a) | 0;
+            h1 = (h1 + b) | 0;
+            h2 = (h2 + c) | 0;
+            h3 = (h3 + d) | 0;
+            h4 = (h4 + e) | 0;
+        }
+
+        const hex = (n) => (n >>> 0).toString(16).padStart(8, '0');
+        return (hex(h0) + hex(h1) + hex(h2) + hex(h3) + hex(h4)).toLowerCase();
+    }
+
+    function extractInfoHashFromTorrentBytes(bytes) {
+        if (!bytes || bytes.length === 0) return null;
+        const len = bytes.length;
+        let infoStart = -1;
+        // 检索 "4:info" 关键字 (ASCII: 52, 58, 105, 110, 102, 111)
+        for (let i = 0; i < len - 7; i++) {
+            if (bytes[i] === 52 && bytes[i+1] === 58 && bytes[i+2] === 105 &&
+                bytes[i+3] === 110 && bytes[i+4] === 102 && bytes[i+5] === 111) {
+                infoStart = i + 6;
+                break;
+            }
+        }
+        if (infoStart === -1) return null;
+
+        let pos = infoStart;
+        function parseValue() {
+            if (pos >= len) throw new Error('Unexpected EOF');
+            const byte = bytes[pos];
+            if (byte === 105) { // 'i' 整数
+                pos++;
+                while (pos < len && bytes[pos] !== 101) pos++;
+                if (pos >= len) throw new Error('Unterminated int');
+                pos++; // 跳过 'e'
+            } else if (byte === 108 || byte === 100) { // 'l' 列表 或 'd' 字典
+                pos++;
+                while (pos < len && bytes[pos] !== 101) {
+                    parseValue();
+                }
+                if (pos >= len) throw new Error('Unterminated list/dict');
+                pos++; // 跳过 'e'
+            } else if (byte >= 48 && byte <= 57) { // 字符串以长度数字 0-9 开头
+                let colonIdx = pos;
+                while (colonIdx < len && bytes[colonIdx] >= 48 && bytes[colonIdx] <= 57) {
+                    colonIdx++;
+                }
+                if (colonIdx >= len || bytes[colonIdx] !== 58) throw new Error('Invalid string length');
+                let strLen = 0;
+                for (let i = pos; i < colonIdx; i++) {
+                    strLen = strLen * 10 + (bytes[i] - 48);
+                }
+                pos = colonIdx + 1 + strLen;
+            } else {
+                throw new Error('Unknown bencode token: ' + byte);
+            }
+        }
+
+        try {
+            parseValue();
+            const infoBytes = bytes.subarray(infoStart, pos);
+            return sha1(infoBytes);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function resolveTorrentToMagnet(torrentUrl, title) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: torrentUrl,
+                responseType: 'arraybuffer',
+                timeout: 25000,
+                headers: {
+                    'Referer': window.location.href,
+                    'User-Agent': navigator.userAgent,
+                    'Accept': 'application/x-bittorrent, */*'
+                },
+                onload: (res) => {
+                    try {
+                        if (res.status >= 200 && res.status < 300) {
+                            const bytes = new Uint8Array(res.response);
+                            const infoHash = extractInfoHashFromTorrentBytes(bytes);
+                            if (!infoHash) {
+                                reject(new Error('未能从种子文件中解析出有效 InfoHash'));
+                                return;
+                            }
+                            const cleanTitle = title || '种子文件直推';
+                            const magnet = `magnet:?xt=urn:btih:${infoHash}&dn=${encodeURIComponent(cleanTitle)}`;
+                            resolve({ magnet, infoHash });
+                        } else {
+                            reject(new Error(`下载种子失败，HTTP状态码: ${res.status}`));
+                        }
+                    } catch (e) {
+                        reject(new Error(`解析种子异常: ${e.message}`));
+                    }
+                },
+                onerror: () => reject(new Error('网络请求错误，无法下载种子文件')),
+                ontimeout: () => reject(new Error('下载种子文件超时'))
+            });
+        });
+    }
+
     /**
      * 全网智能标题推导引擎（兼容各类影视站、Nyaa、1337x、蜜柑及论坛种子附件）
      */
@@ -431,7 +585,22 @@
             updateButtonState(button, 'PUSHING');
 
             try {
-                const targetUrl = magnetLink || torrentUrl;
+                let targetUrl = magnetLink;
+                let activeHash = infoHash;
+
+                if (!targetUrl && torrentUrl) {
+                    updateButtonState(button, 'PUSHING', '⏳ 解析种子...');
+                    try {
+                        const resolved = await resolveTorrentToMagnet(torrentUrl, title);
+                        targetUrl = resolved.magnet;
+                        activeHash = resolved.infoHash;
+                    } catch (resolveErr) {
+                        console.warn('[迅雷Webhook] 浏览器端解析种子失败，回退由服务端解析:', resolveErr);
+                        targetUrl = torrentUrl;
+                    }
+                }
+
+                updateButtonState(button, 'PUSHING', '⏳ 推送中...');
                 const res = await pushToWebhook(targetUrl, title);
 
                 const taskName = res.task_name || title;
@@ -440,7 +609,7 @@
 
                 // 记录推送历史
                 const historyMap = GM_getValue('xl_pushed_hashes', {});
-                if (infoHash) historyMap[infoHash] = true;
+                if (activeHash) historyMap[activeHash] = true;
                 if (torrentUrl) historyMap[torrentUrl] = true;
                 GM_setValue('xl_pushed_hashes', historyMap);
             } catch (err) {
