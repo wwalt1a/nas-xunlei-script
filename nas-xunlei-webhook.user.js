@@ -23,6 +23,136 @@
     const DEFAULT_SECRET = '';
 
     // -------------------------------------------------------------------------
+    // 全局网络与交互拦截层（支持 ext.to 等带动态 HMAC/Token 签名的防盗链站点）
+    // -------------------------------------------------------------------------
+    const extMagnetCache = new Map(); // id -> magnet url
+    let extMagnetResolvers = [];
+
+    (function initNetworkInterceptor() {
+        const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        if (!win || win.__xl_interceptor_injected) return;
+        win.__xl_interceptor_injected = true;
+
+        // 1. 劫持 XMLHttpRequest，捕获任何包含 magnet: 响应的 API (如 ext.to /ajax/getSearchMagnet.php)
+        const origOpen = win.XMLHttpRequest.prototype.open;
+        const origSend = win.XMLHttpRequest.prototype.send;
+
+        win.XMLHttpRequest.prototype.open = function(method, url) {
+            this._xl_url = url ? url.toString() : '';
+            return origOpen.apply(this, arguments);
+        };
+
+        win.XMLHttpRequest.prototype.send = function(body) {
+            this.addEventListener('load', function() {
+                try {
+                    const text = this.responseText;
+                    if (text && text.includes('magnet:?xt=')) {
+                        let parsed = null;
+                        try { parsed = JSON.parse(text); } catch (e) {}
+                        const magMatch = text.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]+[^\s"'<>\\`]+/i);
+                        const foundMagnet = (parsed && parsed.url && parsed.url.startsWith('magnet:')) ? parsed.url : (magMatch ? magMatch[0] : null);
+
+                        if (foundMagnet) {
+                            let reqId = '';
+                            if (typeof body === 'string') {
+                                const m = body.match(/(?:torrent_id|id)=([0-9]+)/);
+                                if (m) reqId = m[1];
+                            }
+                            if (reqId) {
+                                extMagnetCache.set(reqId, foundMagnet);
+                            }
+
+                            if (extMagnetResolvers.length > 0) {
+                                const resolvers = [...extMagnetResolvers];
+                                extMagnetResolvers = [];
+                                resolvers.forEach(r => r(foundMagnet));
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.debug('[迅雷助手] XHR 拦截解析忽略:', e);
+                }
+            });
+            return origSend.apply(this, arguments);
+        };
+
+        // 2. 劫持原生 fetch
+        if (typeof win.fetch === 'function') {
+            const origFetch = win.fetch;
+            win.fetch = async function(...args) {
+                const response = await origFetch.apply(this, args);
+                try {
+                    const clone = response.clone();
+                    clone.text().then(text => {
+                        if (text && text.includes('magnet:?xt=')) {
+                            let parsed = null;
+                            try { parsed = JSON.parse(text); } catch (e) {}
+                            const magMatch = text.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]+[^\s"'<>\\`]+/i);
+                            const foundMagnet = (parsed && parsed.url && parsed.url.startsWith('magnet:')) ? parsed.url : (magMatch ? magMatch[0] : null);
+                            if (foundMagnet && extMagnetResolvers.length > 0) {
+                                const resolvers = [...extMagnetResolvers];
+                                extMagnetResolvers = [];
+                                resolvers.forEach(r => r(foundMagnet));
+                            }
+                        }
+                    }).catch(() => {});
+                } catch (e) {}
+                return response;
+            };
+        }
+
+        // 3. 劫持原生 HTMLAnchorElement.prototype.click，避免静默触发时唤起本地 BT 软件
+        const origAnchorClick = win.HTMLAnchorElement.prototype.click;
+        win.HTMLAnchorElement.prototype.click = function() {
+            const href = this.href || '';
+            if (win.__xl_suppress_native_click && (href.startsWith('magnet:') || href.includes('magnet:?xt='))) {
+                console.log('[迅雷助手] 成功拦截原生磁链弹窗唤醒:', href);
+                if (extMagnetResolvers.length > 0) {
+                    const resolvers = [...extMagnetResolvers];
+                    extMagnetResolvers = [];
+                    resolvers.forEach(r => r(href));
+                }
+                return;
+            }
+            return origAnchorClick.apply(this, arguments);
+        };
+    })();
+
+    function fetchExtMagnetFromNative(nativeBtn, torrentId) {
+        return new Promise((resolve, reject) => {
+            if (torrentId && extMagnetCache.has(torrentId)) {
+                resolve(extMagnetCache.get(torrentId));
+                return;
+            }
+
+            const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+            win.__xl_suppress_native_click = true;
+
+            const timer = setTimeout(() => {
+                win.__xl_suppress_native_click = false;
+                reject(new Error('获取动态磁链超时，请重试'));
+            }, 10000);
+
+            const resolver = (magnet) => {
+                clearTimeout(timer);
+                win.__xl_suppress_native_click = false;
+                if (torrentId && magnet) extMagnetCache.set(torrentId, magnet);
+                resolve(magnet);
+            };
+
+            extMagnetResolvers.push(resolver);
+
+            try {
+                nativeBtn.click();
+            } catch (err) {
+                clearTimeout(timer);
+                win.__xl_suppress_native_click = false;
+                reject(new Error('触发原生下载失败: ' + err.message));
+            }
+        });
+    }
+
+    // -------------------------------------------------------------------------
     // 基础工具与轻量 Toast 浮窗组件
     // -------------------------------------------------------------------------
     function showToast(title, message, type = 'info') {
@@ -264,6 +394,9 @@
         // 3. 表格行内查找
         const row = targetElement.closest('tr, li, .torrent-item, .item');
         if (row) {
+            const extTitle = row.querySelector('a.torrent-title-link');
+            if (extTitle && extTitle.innerText.trim()) return extTitle.innerText.trim();
+
             const torrentA = row.querySelector('a[href*=".torrent"], a[href*="attach-download"]');
             if (torrentA && torrentA.innerText.trim() && /\.torrent$/i.test(torrentA.innerText.trim())) {
                 return torrentA.innerText.trim().replace(/\.torrent$/i, '');
@@ -492,12 +625,15 @@
         }
     }
 
-    function addDownloadButton(targetElement, magnetLink, torrentUrl) {
+    function addDownloadButton(targetElement, magnetLink, torrentUrl, options = {}) {
         if (targetElement.dataset.xunleiProcessed) return;
+
+        const isExt = Boolean(options && options.isExt);
+        const torrentId = options && options.torrentId ? options.torrentId : '';
 
         const infoHash = magnetLink ? extractInfoHash(magnetLink) : '';
         const history = GM_getValue('xl_pushed_hashes', {});
-        const isPushed = infoHash ? Boolean(history[infoHash]) : (torrentUrl ? Boolean(history[torrentUrl]) : false);
+        const isPushed = infoHash ? Boolean(history[infoHash]) : (torrentUrl ? Boolean(history[torrentUrl]) : (torrentId ? Boolean(history['ext_' + torrentId]) : false));
 
         const title = extractSmartTitle(targetElement, magnetLink);
 
@@ -505,6 +641,7 @@
         button.className = 'xunlei-webhook-btn';
         if (infoHash) button.dataset.hash = infoHash;
         if (torrentUrl) button.dataset.torrentUrl = torrentUrl;
+        if (torrentId) button.dataset.extId = torrentId;
 
         // 识别场景模式 (icon / group / normal)
         const isIconMode = Boolean(
@@ -512,7 +649,8 @@
             targetElement.tagName === 'IMG' ||
             targetElement.tagName === 'SVG' ||
             (targetElement.parentElement && targetElement.parentElement.classList && targetElement.parentElement.classList.contains('item-icons')) ||
-            (targetElement.offsetWidth > 0 && targetElement.offsetWidth <= 32 && !targetElement.textContent.trim())
+            (targetElement.offsetWidth > 0 && targetElement.offsetWidth <= 32 && !targetElement.textContent.trim()) ||
+            (targetElement.classList && (targetElement.classList.contains('dwn-btn') || targetElement.classList.contains('search-magnet-btn')))
         );
 
         const isGroupMode = !isIconMode && Boolean(
@@ -588,6 +726,12 @@
                 let targetUrl = magnetLink;
                 let activeHash = infoHash;
 
+                if (!targetUrl && isExt && options.nativeBtn) {
+                    updateButtonState(button, 'PUSHING', '⏳ 获取磁链...');
+                    targetUrl = await fetchExtMagnetFromNative(options.nativeBtn, torrentId);
+                    activeHash = extractInfoHash(targetUrl);
+                }
+
                 if (!targetUrl && torrentUrl) {
                     updateButtonState(button, 'PUSHING', '⏳ 解析种子...');
                     try {
@@ -598,6 +742,10 @@
                         console.warn('[迅雷Webhook] 浏览器端解析种子失败，回退由服务端解析:', resolveErr);
                         targetUrl = torrentUrl;
                     }
+                }
+
+                if (!targetUrl) {
+                    throw new Error('未能获取到有效的磁力下载链接');
                 }
 
                 updateButtonState(button, 'PUSHING', '⏳ 推送中...');
@@ -611,6 +759,7 @@
                 const historyMap = GM_getValue('xl_pushed_hashes', {});
                 if (activeHash) historyMap[activeHash] = true;
                 if (torrentUrl) historyMap[torrentUrl] = true;
+                if (torrentId) historyMap['ext_' + torrentId] = true;
                 GM_setValue('xl_pushed_hashes', historyMap);
             } catch (err) {
                 if (err.message === 'CONFIG_REQUIRED' || err.message === 'AUTH_FORBIDDEN') {
@@ -885,6 +1034,18 @@
                 });
                 textNode.parentElement.dataset.xunleiProcessed = 'true';
             }
+        });
+
+        // 动态防盗链网站按钮探测 (如 ext.to 的 .search-magnet-btn)
+        const dynamicButtons = Array.from(document.querySelectorAll('.search-magnet-btn, a[data-id][title*="Download magnet link"], a[data-id][title*="magnet" i]'));
+        dynamicButtons.forEach(btn => {
+            if (btn.dataset.xunleiProcessed) return;
+            const torrentId = btn.getAttribute('data-id') || '';
+            const container = findItemContainer(btn);
+            if (torrentId && container.querySelector(`.xunlei-webhook-btn[data-ext-id="${torrentId}"]`)) return;
+
+            addDownloadButton(btn, '', '', { isExt: true, nativeBtn: btn, torrentId });
+            foundAny = true;
         });
 
         // 种子文件与论坛附件扫描（1lou、NexusPHP、Discuz等）
