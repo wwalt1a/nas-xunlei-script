@@ -524,6 +524,7 @@
                 method: 'GET',
                 url: torrentUrl,
                 responseType: 'arraybuffer',
+                overrideMimeType: 'text/plain; charset=x-user-defined',
                 timeout: 25000,
                 headers: {
                     'Referer': window.location.href,
@@ -533,7 +534,22 @@
                 onload: (res) => {
                     try {
                         if (res.status >= 200 && res.status < 300) {
-                            const bytes = new Uint8Array(res.response);
+                            let bytes = null;
+                            if (res.response instanceof ArrayBuffer) {
+                                bytes = new Uint8Array(res.response);
+                            } else if (res.response && res.response.buffer instanceof ArrayBuffer) {
+                                bytes = new Uint8Array(res.response.buffer);
+                            } else if (typeof res.responseText === 'string' && res.responseText.length > 0) {
+                                const raw = res.responseText;
+                                bytes = new Uint8Array(raw.length);
+                                for (let i = 0; i < raw.length; i++) {
+                                    bytes[i] = raw.charCodeAt(i) & 0xff;
+                                }
+                            }
+                            if (!bytes || bytes.length === 0) {
+                                reject(new Error('未能读取种子二进制数据'));
+                                return;
+                            }
                             const infoHash = extractInfoHashFromTorrentBytes(bytes);
                             if (!infoHash) {
                                 reject(new Error('未能从种子文件中解析出有效 InfoHash'));
