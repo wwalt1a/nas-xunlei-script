@@ -46,9 +46,25 @@
 | **🐱 GitHub 官方 Raw** | [点击一键安装](https://raw.githubusercontent.com/wwalt1a/nas-xunlei-script/main/nas-xunlei-webhook.user.js) | 官方源（需要顺畅的网络环境） |
 
 > **方案 B 使用教程**：
-> 1. 安装脚本后首次点击「⚡ 迅雷直推」或在油猴菜单点击「⚙️ 群晖 Webhook 设置」；
-> 2. 填写您的群晖 Webhook 端点地址（如 `http://<NAS_IP>:9000/hooks/xunlei-push` 或外网反代域名）以及访问 Secret 密钥并保存；
-> 3. 支持 iOS 快捷指令：在手机端配置相同的 Webhook POST 请求，长按磁力链接点击「分享」即可直接推送。
+> 1. **PC 浏览器**：安装脚本后首次点击「⚡ 迅雷直推」或在油猴菜单点击「⚙️ 群晖 Webhook 设置」，填入您的 Webhook 端点与密钥；
+> 2. **iOS (iPhone / iPad)**：支持系统「快捷指令」（长按分享直推 / 轻敲背面两下秒推）与 Safari 浏览器扩展（Stay / Userscripts）；
+> 3. **Android**：支持 Via 浏览器原生运行油猴脚本、开源神器 HTTP Shortcuts 系统级分享与下拉通知栏磁贴直推。
+
+---
+
+## 📱 移动端 (iOS & Android) 优雅使用指南
+
+### 1. iOS (iPhone / iPad)
+- **系统级快捷指令（长按分享 & 盲操秒推）**：
+  1. 新建快捷指令，添加「如果 [快捷指令输入] [没有值] ➔ 获取剪贴板 ➔ 结束如果」；
+  2. 添加「获取 URL 内容」，方法选 `POST`，请求体选 `JSON`，添加字段 `url` 对应 `[如果的结果]`；
+  3. 添加「获取字典值 (message)」并「显示通知」；
+  4. 支持长按磁链点击「分享」一键推送，或设置「轻点手机背面两下」无感直推。
+- **Safari 移动端油猴**：App Store 安装 **Stay 2** 扩展并导入脚本，手机 Safari 网页行内直接浮现「⚡」按钮。
+
+### 2. Android (安卓手机 / 平板)
+- **Via 浏览器直接安装（极力推荐）**：Via 原生内置脚本引擎，直接访问上方 jsDelivr 链接即可弹出安装，网页行内直接点击「⚡」秒推；
+- **开源神器 HTTP Shortcuts**：酷安/GitHub 免费下载，新建 POST 快捷方式（Body 为 `{"url": "{shared:text|clipboard}"}`），支持系统长按分享菜单直推，或添加至 Android 顶部下拉控制中心磁贴 (Quick Settings Tile) 一键推送。
 
 ---
 
