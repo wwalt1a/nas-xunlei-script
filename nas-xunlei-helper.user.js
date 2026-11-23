@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         迅雷下载助手脚本版
 // @namespace    https://github.com/saaak/xunlei-docker-ext
-// @version      1.4.4
+// @version      1.4.5
 // @description  基于 saaak/xunlei-docker-ext 扩展移植重构，专为迅雷 NAS (群晖 DSM / Docker / 威联通 QNAP) 与 Firefox / Chrome 深度适配。一键抓取全网磁力链接与种子文件（.torrent）推送到远程 NAS，支持双向下载状态实时同步与目录平铺直存。
 // @author       Community
 // @license      MIT
@@ -518,7 +518,37 @@
         }
     }
 
-    function resolveTorrentToMagnet(torrentUrl, title) {
+    async function resolveTorrentToMagnet(torrentUrl, title) {
+        // 1. 优先尝试原生 fetch（针对同源站点如 sukebei.nyaa.si，直接调用 iOS WebKit 原生网络栈，绕过 Orion/Violentmonkey 扩展后台 IPC 消息传递与 ArrayBuffer 序列化异常）
+        try {
+            const isSameOrigin = (function () {
+                try {
+                    return new URL(torrentUrl, window.location.href).origin === window.location.origin;
+                } catch (e) {
+                    return false;
+                }
+            })();
+
+            if (isSameOrigin && typeof fetch === 'function') {
+                const resp = await fetch(torrentUrl, { credentials: 'same-origin' });
+                if (resp && resp.ok) {
+                    const buffer = await resp.arrayBuffer();
+                    if (buffer && buffer.byteLength > 0) {
+                        const bytes = new Uint8Array(buffer);
+                        const infoHash = extractInfoHashFromTorrentBytes(bytes);
+                        if (infoHash) {
+                            const cleanTitle = title || '种子文件直推';
+                            const magnet = `magnet:?xt=urn:btih:${infoHash}&dn=${encodeURIComponent(cleanTitle)}`;
+                            return { magnet, infoHash };
+                        }
+                    }
+                }
+            }
+        } catch (fetchErr) {
+            console.debug('[迅雷助手] 原生 fetch 解析种子忽略，回退 GM_xmlhttpRequest:', fetchErr);
+        }
+
+        // 2. 跨域或 fetch 受阻时，回退至 GM_xmlhttpRequest
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'GET',
