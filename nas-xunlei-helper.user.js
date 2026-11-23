@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         迅雷下载助手脚本版
 // @namespace    https://github.com/saaak/xunlei-docker-ext
-// @version      1.4.1
+// @version      1.4.2
 // @description  基于 saaak/xunlei-docker-ext 扩展移植重构，专为迅雷 NAS (群晖 DSM / Docker / 威联通 QNAP) 与 Firefox / Chrome 深度适配。一键抓取全网磁力链接与种子文件（.torrent）推送到远程 NAS，支持双向下载状态实时同步与目录平铺直存。
 // @author       Community
 // @license      MIT
@@ -23,6 +23,65 @@
     const CLIENT_VERSION = '8.31.0.9726';
     const PACKAGE_NAME = 'com.xunlei.downloadprovider';
     const REDIRECT_URI = 'xlaccsdk01://xunlei.com/callback?state=harbor';
+
+    // -------------------------------------------------------------------------
+    // 域名黑名单与排除机制
+    // -------------------------------------------------------------------------
+    const currentHost = (window.location && window.location.hostname) ? window.location.hostname.toLowerCase() : '';
+
+    function getExcludedDomains() {
+        const val = GM_getValue('xl_excluded_domains', []);
+        return Array.isArray(val) ? val : [];
+    }
+
+    function isCurrentDomainExcluded() {
+        if (!currentHost) return false;
+        const list = getExcludedDomains();
+        return list.some(item => {
+            const d = item.toLowerCase().trim();
+            return d && (currentHost === d || currentHost.endsWith('.' + d));
+        });
+    }
+
+    function addExcludeDomain(host) {
+        if (!host) return;
+        const list = getExcludedDomains().filter(d => d.toLowerCase().trim() !== host);
+        list.push(host);
+        GM_setValue('xl_excluded_domains', list);
+    }
+
+    function removeExcludeDomain(host) {
+        if (!host) return;
+        const list = getExcludedDomains().filter(d => {
+            const item = d.toLowerCase().trim();
+            return item !== host && !host.endsWith('.' + item);
+        });
+        GM_setValue('xl_excluded_domains', list);
+    }
+
+    // 检查当前域名是否被排除
+    if (isCurrentDomainExcluded()) {
+        GM_registerMenuCommand(`✅ 在当前网站启用 (${currentHost})`, () => {
+            removeExcludeDomain(currentHost);
+            alert(`【迅雷助手】已将 ${currentHost} 从排除名单中移除，本脚本将恢复在此网站运行。\n\n页面即将自动刷新。`);
+            window.location.reload();
+        });
+        GM_registerMenuCommand('⚙️ 迅雷 NAS 设置与教程', showConfigModal);
+        console.log(`[迅雷助手] 当前网站 ${currentHost} 处于排除名单中，脚本已自动停用。`);
+        return;
+    }
+
+    GM_registerMenuCommand(`🚫 在当前网站禁用 (${currentHost})`, () => {
+        if (confirm(`【迅雷助手设置】\n\n是否确认在当前网站 (${currentHost}) 禁用本脚本？\n\n禁用后脚本将彻底停止在此网站注入下载按钮与拦截请求。\n您可随时通过油猴扩展菜单重新启用。`)) {
+            addExcludeDomain(currentHost);
+            window.location.reload();
+        }
+    });
+    GM_registerMenuCommand('⚙️ 迅雷 NAS 设置与教程', showConfigModal);
+    GM_registerMenuCommand('🔄 强制刷新群晖下载状态', () => {
+        showToast('正在同步', '正在向群晖请求最新的任务完成状态...', 'info');
+        syncNasTasks();
+    });
 
     // -------------------------------------------------------------------------
     // 全局网络与交互拦截层（支持 ext.to 等带动态 HMAC/Token 签名的防盗链站点）
@@ -946,6 +1005,7 @@
         const currentRunner = GM_getValue('xl_runner_name', '未绑定');
         const currentSpace = GM_getValue('xl_runner_space', '');
         const isSpaceValid = currentSpace && currentSpace.startsWith('device_id#');
+        const excludedDomains = getExcludedDomains();
 
         const modal = document.createElement('div');
         modal.id = 'xl-config-modal';
@@ -982,6 +1042,23 @@
                     </label>
                     <textarea id="xl-token-input" rows="3" placeholder="在此粘贴 a1.xxxx 开头的长效 Refresh Token" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font-size:12px;font-family:monospace;outline:none;resize:vertical;">${currentToken}</textarea>
 
+                    <div style="margin-top:16px;border-top:1px solid #e2e8f0;padding-top:14px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                            <label style="font-size:13px;font-weight:600;color:#334155;">
+                                🚫 域名排除名单 (${excludedDomains.length})：
+                            </label>
+                            ${excludedDomains.length > 0 ? `<button id="xl-btn-clear-excluded" type="button" style="background:none;border:none;color:#ef4444;font-size:12px;cursor:pointer;padding:0;font-weight:500;">清空全部</button>` : ''}
+                        </div>
+                        <div id="xl-excluded-list" style="max-height:90px;overflow-y:auto;display:flex;flex-wrap:wrap;gap:6px;padding:2px 0;">
+                            ${excludedDomains.length === 0 ? '<span style="font-size:12px;color:#94a3b8;">暂无排除域名（脚本在所有网站默认启用）</span>' : excludedDomains.map(domain => `
+                                <span style="display:inline-flex;align-items:center;gap:4px;background:#f1f5f9;border:1px solid #cbd5e1;color:#334155;border-radius:12px;padding:2px 8px;font-size:11px;font-family:monospace;">
+                                    ${domain}
+                                    <span class="xl-remove-domain-btn" data-domain="${domain}" style="cursor:pointer;color:#94a3b8;font-weight:bold;margin-left:2px;font-size:13px;line-height:1;" title="移除排除">×</span>
+                                </span>
+                            `).join('')}
+                        </div>
+                    </div>
+
                     <div style="margin-top:18px;display:flex;justify-content:space-between;align-items:center;">
                         <button id="xl-btn-clear" style="padding:8px 14px;border:1px solid #fca5a5;background:#fff1f2;color:#e11d48;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">清空缓存</button>
                         <div style="display:flex;gap:10px;">
@@ -993,6 +1070,31 @@
             </div>
         `;
         document.body.appendChild(modal);
+
+        modal.querySelectorAll('.xl-remove-domain-btn').forEach(btn => {
+            btn.onclick = () => {
+                const domain = btn.dataset.domain;
+                removeExcludeDomain(domain);
+                showToast('已移除排除', `${domain} 将恢复启用`, 'info');
+                btn.parentElement.remove();
+                if (domain === currentHost) {
+                    setTimeout(() => window.location.reload(), 800);
+                }
+            };
+        });
+
+        const clearExcludedBtn = modal.querySelector('#xl-btn-clear-excluded');
+        if (clearExcludedBtn) {
+            clearExcludedBtn.onclick = () => {
+                GM_setValue('xl_excluded_domains', []);
+                showToast('已清空排除名单', '所有网站已恢复启用', 'info');
+                modal.querySelector('#xl-excluded-list').innerHTML = '<span style="font-size:12px;color:#94a3b8;">暂无排除域名（脚本在所有网站默认启用）</span>';
+                clearExcludedBtn.remove();
+                if (isCurrentDomainExcluded()) {
+                    setTimeout(() => window.location.reload(), 800);
+                }
+            };
+        }
 
         modal.querySelector('#xl-copy-cmd').onclick = () => {
             navigator.clipboard.writeText("chrome.storage.local.get(['xl_refresh_token'], res => console.log(res.xl_refresh_token))");
@@ -1029,12 +1131,6 @@
             }
         };
     }
-
-    GM_registerMenuCommand('⚙️ 迅雷 NAS 设置与教程', showConfigModal);
-    GM_registerMenuCommand('🔄 强制刷新群晖下载状态', () => {
-        showToast('正在同步', '正在向群晖请求最新的任务完成状态...', 'info');
-        syncNasTasks();
-    });
 
     // -------------------------------------------------------------------------
     // 磁力链接识别、全网智能挂载与交互

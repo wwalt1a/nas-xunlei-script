@@ -2,7 +2,7 @@
 // @name         nas-xunlei-webhook
 // @name:zh-CN   迅雷下载助手 (Webhook 版)
 // @namespace    https://github.com/wwalt1a/nas-xunlei-script
-// @version      1.0.1
+// @version      1.0.2
 // @description  专为群晖 DSM (lwlook/webhook) 与 iOS 快捷指令协同打造的轻量化下载助手。浏览器端零 Token 鉴权，直接将全网磁链与种子附件通过 Webhook 直推到远程群晖迅雷套件，彻底杜绝 Token 冲突与失效问题。
 // @author       Community
 // @license      MIT
@@ -21,6 +21,61 @@
     // 默认配置（支持公网 HTTPS 或内网 HTTP，首次使用请在设置弹窗中填入您的 Webhook 端点）
     const DEFAULT_WEBHOOK_URL = '';
     const DEFAULT_SECRET = '';
+
+    // -------------------------------------------------------------------------
+    // 域名黑名单与排除机制
+    // -------------------------------------------------------------------------
+    const currentHost = (window.location && window.location.hostname) ? window.location.hostname.toLowerCase() : '';
+
+    function getExcludedDomains() {
+        const val = GM_getValue('xl_excluded_domains', []);
+        return Array.isArray(val) ? val : [];
+    }
+
+    function isCurrentDomainExcluded() {
+        if (!currentHost) return false;
+        const list = getExcludedDomains();
+        return list.some(item => {
+            const d = item.toLowerCase().trim();
+            return d && (currentHost === d || currentHost.endsWith('.' + d));
+        });
+    }
+
+    function addExcludeDomain(host) {
+        if (!host) return;
+        const list = getExcludedDomains().filter(d => d.toLowerCase().trim() !== host);
+        list.push(host);
+        GM_setValue('xl_excluded_domains', list);
+    }
+
+    function removeExcludeDomain(host) {
+        if (!host) return;
+        const list = getExcludedDomains().filter(d => {
+            const item = d.toLowerCase().trim();
+            return item !== host && !host.endsWith('.' + item);
+        });
+        GM_setValue('xl_excluded_domains', list);
+    }
+
+    // 检查当前域名是否被排除
+    if (isCurrentDomainExcluded()) {
+        GM_registerMenuCommand(`✅ 在当前网站启用 (${currentHost})`, () => {
+            removeExcludeDomain(currentHost);
+            alert(`【迅雷助手】已将 ${currentHost} 从排除名单中移除，本脚本将恢复在此网站运行。\n\n页面即将自动刷新。`);
+            window.location.reload();
+        });
+        GM_registerMenuCommand('⚙️ 群晖 Webhook 设置', showConfigModal);
+        console.log(`[迅雷助手] 当前网站 ${currentHost} 处于排除名单中，脚本已自动停用。`);
+        return;
+    }
+
+    GM_registerMenuCommand(`🚫 在当前网站禁用 (${currentHost})`, () => {
+        if (confirm(`【迅雷助手设置】\n\n是否确认在当前网站 (${currentHost}) 禁用本脚本？\n\n禁用后脚本将彻底停止在此网站注入下载按钮与拦截请求。\n您可随时通过油猴扩展菜单重新启用。`)) {
+            addExcludeDomain(currentHost);
+            window.location.reload();
+        }
+    });
+    GM_registerMenuCommand('⚙️ 群晖 Webhook 设置', showConfigModal);
 
     // -------------------------------------------------------------------------
     // 全局网络与交互拦截层（支持 ext.to 等带动态 HMAC/Token 签名的防盗链站点）
@@ -498,6 +553,7 @@
 
         const currentUrl = GM_getValue('xl_webhook_url', DEFAULT_WEBHOOK_URL);
         const currentSecret = GM_getValue('xl_webhook_secret', DEFAULT_SECRET);
+        const excludedDomains = getExcludedDomains();
 
         const modal = document.createElement('div');
         modal.id = 'xl-webhook-modal';
@@ -527,6 +583,23 @@
                     </label>
                     <input id="xl-webhook-input-secret" type="text" value="${currentSecret}" placeholder="请输入 Webhook 访问密钥 Secret（若未设置可留空）" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font-size:13px;font-family:monospace;outline:none;" />
 
+                    <div style="margin-top:16px;border-top:1px solid #e2e8f0;padding-top:14px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                            <label style="font-size:13px;font-weight:600;color:#334155;">
+                                🚫 域名排除名单 (${excludedDomains.length})：
+                            </label>
+                            ${excludedDomains.length > 0 ? `<button id="xl-webhook-btn-clear-excluded" type="button" style="background:none;border:none;color:#ef4444;font-size:12px;cursor:pointer;padding:0;font-weight:500;">清空全部</button>` : ''}
+                        </div>
+                        <div id="xl-webhook-excluded-list" style="max-height:90px;overflow-y:auto;display:flex;flex-wrap:wrap;gap:6px;padding:2px 0;">
+                            ${excludedDomains.length === 0 ? '<span style="font-size:12px;color:#94a3b8;">暂无排除域名（脚本在所有网站默认启用）</span>' : excludedDomains.map(domain => `
+                                <span style="display:inline-flex;align-items:center;gap:4px;background:#f1f5f9;border:1px solid #cbd5e1;color:#334155;border-radius:12px;padding:2px 8px;font-size:11px;font-family:monospace;">
+                                    ${domain}
+                                    <span class="xl-remove-domain-btn" data-domain="${domain}" style="cursor:pointer;color:#94a3b8;font-weight:bold;margin-left:2px;font-size:13px;line-height:1;" title="移除排除">×</span>
+                                </span>
+                            `).join('')}
+                        </div>
+                    </div>
+
                     <div style="margin-top:20px;display:flex;justify-content:space-between;align-items:center;">
                         <button id="xl-webhook-btn-test" style="padding:8px 14px;border:1px solid #cbd5e1;background:#f8fafc;color:#334155;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">🔗 测试连通性</button>
                         <div style="display:flex;gap:10px;">
@@ -538,6 +611,31 @@
             </div>
         `;
         document.body.appendChild(modal);
+
+        modal.querySelectorAll('.xl-remove-domain-btn').forEach(btn => {
+            btn.onclick = () => {
+                const domain = btn.dataset.domain;
+                removeExcludeDomain(domain);
+                showToast('已移除排除', `${domain} 将恢复启用`, 'info');
+                btn.parentElement.remove();
+                if (domain === currentHost) {
+                    setTimeout(() => window.location.reload(), 800);
+                }
+            };
+        });
+
+        const clearExcludedBtn = modal.querySelector('#xl-webhook-btn-clear-excluded');
+        if (clearExcludedBtn) {
+            clearExcludedBtn.onclick = () => {
+                GM_setValue('xl_excluded_domains', []);
+                showToast('已清空排除名单', '所有网站已恢复启用', 'info');
+                modal.querySelector('#xl-webhook-excluded-list').innerHTML = '<span style="font-size:12px;color:#94a3b8;">暂无排除域名（脚本在所有网站默认启用）</span>';
+                clearExcludedBtn.remove();
+                if (isCurrentDomainExcluded()) {
+                    setTimeout(() => window.location.reload(), 800);
+                }
+            };
+        }
 
         modal.querySelector('#xl-webhook-btn-cancel').onclick = () => modal.remove();
 
@@ -584,8 +682,6 @@
             modal.remove();
         };
     }
-
-    GM_registerMenuCommand('⚙️ 群晖 Webhook 设置', showConfigModal);
 
     // -------------------------------------------------------------------------
     // 按钮渲染与交互挂载
