@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         迅雷下载助手脚本版
 // @namespace    https://github.com/saaak/xunlei-docker-ext
-// @version      1.4.2
+// @version      1.4.3
 // @description  基于 saaak/xunlei-docker-ext 扩展移植重构，专为迅雷 NAS (群晖 DSM / Docker / 威联通 QNAP) 与 Firefox / Chrome 深度适配。一键抓取全网磁力链接与种子文件（.torrent）推送到远程 NAS，支持双向下载状态实时同步与目录平铺直存。
 // @author       Community
 // @license      MIT
@@ -25,9 +25,22 @@
     const REDIRECT_URI = 'xlaccsdk01://xunlei.com/callback?state=harbor';
 
     // -------------------------------------------------------------------------
-    // 域名黑名单与排除机制
+    // 域名黑名单与局域网安全过滤机制
     // -------------------------------------------------------------------------
     const currentHost = (window.location && window.location.hostname) ? window.location.hostname.toLowerCase() : '';
+
+    function isPrivateNetwork(host) {
+        if (!host) return false;
+        if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
+        // IPv4 私有网段 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)
+        if (/^(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3})$/.test(host)) {
+            return true;
+        }
+        if (/\.(local|lan|internal|home|corp)$/i.test(host)) return true;
+        const port = window.location ? window.location.port : '';
+        if (port === '5000' || port === '5001' || port === '5005' || port === '5006') return true;
+        return false;
+    }
 
     function getExcludedDomains() {
         const val = GM_getValue('xl_excluded_domains', []);
@@ -59,7 +72,17 @@
         GM_setValue('xl_excluded_domains', list);
     }
 
-    // 检查当前域名是否被排除
+    // 1. 局域网私有网段与群晖/路由器管理后台安全保护：默认彻底跳过，杜绝系统冲突
+    if (isPrivateNetwork(currentHost)) {
+        console.log(`[迅雷助手] 检测到当前处于私有局域网/群晖管理页面 (${currentHost})，脚本已自动安全停用，避免干扰管理系统。`);
+        GM_registerMenuCommand(`🔒 局域网/管理后台已自动安全忽略 (${currentHost})`, () => {
+            alert(`【迅雷助手安全防护】\n\n检测到当前地址 (${currentHost}) 属于私有局域网 IP 或 NAS/路由器管理后台。\n\n为确保群晖 DSM、路由器等核心系统运行绝对稳定，本脚本在此类页面已自动完全停用，不会执行任何网络拦截和按钮注入。`);
+        });
+        GM_registerMenuCommand('⚙️ 迅雷 NAS 设置与教程', showConfigModal);
+        return;
+    }
+
+    // 2. 检查当前域名是否处于用户手动排除名单
     if (isCurrentDomainExcluded()) {
         GM_registerMenuCommand(`✅ 在当前网站启用 (${currentHost})`, () => {
             removeExcludeDomain(currentHost);
@@ -84,12 +107,20 @@
     });
 
     // -------------------------------------------------------------------------
-    // 全局网络与交互拦截层（支持 ext.to 等带动态 HMAC/Token 签名的防盗链站点）
+    // 动态网络与交互拦截层（仅在 ext.to 等已知动态 API 签名站点激活，杜绝全网污染）
     // -------------------------------------------------------------------------
     const extMagnetCache = new Map(); // id -> magnet url
     let extMagnetResolvers = [];
 
+    function needsNetworkInterceptor(host) {
+        if (!host) return false;
+        const dynamicSites = ['ext.to', 'ext.is', 'ext.stream', 'extratorrent'];
+        return dynamicSites.some(d => host === d || host.endsWith('.' + d));
+    }
+
     (function initNetworkInterceptor() {
+        if (!needsNetworkInterceptor(currentHost)) return;
+
         const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
         if (!win || win.__xl_interceptor_injected) return;
         win.__xl_interceptor_injected = true;
@@ -106,27 +137,30 @@
         win.XMLHttpRequest.prototype.send = function(body) {
             this.addEventListener('load', function() {
                 try {
-                    const text = this.responseText;
-                    if (text && text.includes('magnet:?xt=')) {
-                        let parsed = null;
-                        try { parsed = JSON.parse(text); } catch (e) {}
-                        const magMatch = text.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]+[^\s"'<>\\`]+/i);
-                        const foundMagnet = (parsed && parsed.url && parsed.url.startsWith('magnet:')) ? parsed.url : (magMatch ? magMatch[0] : null);
+                    // 安全校验：仅在纯文本或默认模式下读取 responseText，防止 InvalidStateError
+                    if (!this.responseType || this.responseType === 'text') {
+                        const text = this.responseText;
+                        if (text && text.includes('magnet:?xt=')) {
+                            let parsed = null;
+                            try { parsed = JSON.parse(text); } catch (e) {}
+                            const magMatch = text.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]+[^\s"'<>\\`]+/i);
+                            const foundMagnet = (parsed && parsed.url && parsed.url.startsWith('magnet:')) ? parsed.url : (magMatch ? magMatch[0] : null);
 
-                        if (foundMagnet) {
-                            let reqId = '';
-                            if (typeof body === 'string') {
-                                const m = body.match(/(?:torrent_id|id)=([0-9]+)/);
-                                if (m) reqId = m[1];
-                            }
-                            if (reqId) {
-                                extMagnetCache.set(reqId, foundMagnet);
-                            }
+                            if (foundMagnet) {
+                                let reqId = '';
+                                if (typeof body === 'string') {
+                                    const m = body.match(/(?:torrent_id|id)=([0-9]+)/);
+                                    if (m) reqId = m[1];
+                                }
+                                if (reqId) {
+                                    extMagnetCache.set(reqId, foundMagnet);
+                                }
 
-                            if (extMagnetResolvers.length > 0) {
-                                const resolvers = [...extMagnetResolvers];
-                                extMagnetResolvers = [];
-                                resolvers.forEach(r => r(foundMagnet));
+                                if (extMagnetResolvers.length > 0) {
+                                    const resolvers = [...extMagnetResolvers];
+                                    extMagnetResolvers = [];
+                                    resolvers.forEach(r => r(foundMagnet));
+                                }
                             }
                         }
                     }
@@ -137,28 +171,34 @@
             return origSend.apply(this, arguments);
         };
 
-        // 2. 劫持原生 fetch
+        // 2. 劫持原生 fetch (严格绑定宿主 window 上下文，杜绝 Illegal invocation 异常与跨 Realm 污染)
         if (typeof win.fetch === 'function') {
             const origFetch = win.fetch;
-            win.fetch = async function(...args) {
-                const response = await origFetch.apply(this, args);
-                try {
-                    const clone = response.clone();
-                    clone.text().then(text => {
-                        if (text && text.includes('magnet:?xt=')) {
-                            let parsed = null;
-                            try { parsed = JSON.parse(text); } catch (e) {}
-                            const magMatch = text.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]+[^\s"'<>\\`]+/i);
-                            const foundMagnet = (parsed && parsed.url && parsed.url.startsWith('magnet:')) ? parsed.url : (magMatch ? magMatch[0] : null);
-                            if (foundMagnet && extMagnetResolvers.length > 0) {
-                                const resolvers = [...extMagnetResolvers];
-                                extMagnetResolvers = [];
-                                resolvers.forEach(r => r(foundMagnet));
+            win.fetch = function(...args) {
+                const promise = origFetch.apply(win, args);
+                if (promise && typeof promise.then === 'function') {
+                    promise.then(response => {
+                        try {
+                            if (response && typeof response.clone === 'function') {
+                                const clone = response.clone();
+                                clone.text().then(text => {
+                                    if (text && text.includes('magnet:?xt=')) {
+                                        let parsed = null;
+                                        try { parsed = JSON.parse(text); } catch (e) {}
+                                        const magMatch = text.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]+[^\s"'<>\\`]+/i);
+                                        const foundMagnet = (parsed && parsed.url && parsed.url.startsWith('magnet:')) ? parsed.url : (magMatch ? magMatch[0] : null);
+                                        if (foundMagnet && extMagnetResolvers.length > 0) {
+                                            const resolvers = [...extMagnetResolvers];
+                                            extMagnetResolvers = [];
+                                            resolvers.forEach(r => r(foundMagnet));
+                                        }
+                                    }
+                                }).catch(() => {});
                             }
-                        }
+                        } catch (e) {}
                     }).catch(() => {});
-                } catch (e) {}
-                return response;
+                }
+                return promise;
             };
         }
 
